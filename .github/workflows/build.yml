@@ -12,12 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14        # Apple Silicon (arm64)
+          - os: macos-15        # Apple Silicon (arm64), Sequoia
             artifact_name: pinnow-mac-arm64.zip
-            pack_cmd: zip -r pinnow-mac-arm64.zip dist/pinnow.app
           - os: windows-latest
             artifact_name: pinnow-windows.zip
-            pack_cmd: Compress-Archive -Path dist/pinnow -DestinationPath pinnow-windows.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -43,7 +41,7 @@ jobs:
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: zip -r ${{ matrix.artifact_name }} dist/pinnow.app
+        run: cd dist && zip -r ../${{ matrix.artifact_name }} pinnow.app
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
