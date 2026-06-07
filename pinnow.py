@@ -228,9 +228,6 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
                 seen.add(pid)
                 pins.append({"id": pid, "url": to_resolution(raw, "originals")})
 
-    def _is_feed_response(r):
-        return r.status == 200 and any(x in r.url for x in _FEED_RESOURCES)
-
     with sync_playwright() as p:
         if logged_in:
             _log("  로그인 세션 적용됨")
@@ -267,21 +264,8 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
         try:
             while len(pins) < max_pins:
                 prev = len(pins)
-                try:
-                    with page.expect_response(_is_feed_response, timeout=7000):
-                        # 마우스 휠 + scrollTo 조합 — IntersectionObserver 확실히 트리거
-                        page.mouse.wheel(0, 5000)
-                        page.wait_for_timeout(120)
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(600)
-                except PWTimeout:
-                    stall += 1
-                    _log(f"  API 무응답 {stall}회 (현재 {len(pins)}개)")
-                    if stall >= 3:
-                        break
-                    page.wait_for_timeout(1500)
-                    continue
-
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(3000)
                 _flush_dom(page)
                 added = len(pins) - prev
                 if added > 0:
@@ -289,8 +273,10 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
                     stall = 0
                 else:
                     stall += 1
-                    if stall >= 4:
+                    _log(f"  스크롤 무반응 {stall}회 (현재 {len(pins)}개)")
+                    if stall >= 8:
                         break
+                    page.wait_for_timeout(1500)
         finally:
             bar.close()
 

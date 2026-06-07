@@ -979,19 +979,11 @@ def main():
     app._pinnow_lock = lock
     app.setStyle("macOS" if sys.platform == "darwin" else "Fusion")
 
-    # Windows Fusion 테마의 기본 팔레트가 앱 배경을 덮어쓰는 문제 방지
+    # Windows Fusion: 앱 창 배경색만 덮어씀 — 나머지는 QSS에 위임
     if sys.platform == "win32":
         pal = app.palette()
-        pal.setColor(QPalette.ColorRole.Window,         QColor(BG))
-        pal.setColor(QPalette.ColorRole.WindowText,     QColor(TEXT_W))
-        pal.setColor(QPalette.ColorRole.Base,           QColor(BG_DARK))
-        pal.setColor(QPalette.ColorRole.AlternateBase,  QColor(BG_LIGHT))
-        pal.setColor(QPalette.ColorRole.Text,           QColor(TEXT_W))
-        pal.setColor(QPalette.ColorRole.BrightText,     QColor(WHITE))
-        pal.setColor(QPalette.ColorRole.Button,         QColor(SILVER))
-        pal.setColor(QPalette.ColorRole.ButtonText,     QColor(TEXT_S))
-        pal.setColor(QPalette.ColorRole.Highlight,      QColor(BG_LIGHT))
-        pal.setColor(QPalette.ColorRole.HighlightedText,QColor(WHITE))
+        pal.setColor(QPalette.ColorRole.Window,     QColor(BG))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(TEXT_W))
         app.setPalette(pal)
 
     app.setFont(_ui_font(13))
