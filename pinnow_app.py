@@ -15,17 +15,23 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QRect, QTimer, QLockFile, QStandardPaths
-from PyQt6.QtGui import QFont, QFontDatabase, QColor, QPalette, QTextCursor, QPainter, QBrush, QPen, QLinearGradient, QIcon, QPixmap, QImage
+from PyQt6.QtGui import QFont, QFontDatabase, QColor, QPalette, QTextCursor, QPainter, QBrush, QPen, QLinearGradient, QIcon, QPixmap, QImage, QFontMetrics
 
 
 APP_NAME = "pinnow"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 ORG_NAME = "ChoiC0re"
 BRAND_FONT_FILE = "FlorDeRuina-Semilla.otf"
 PIN_IMAGE_FILE = "silver-pin.png"
 UI_FONT_FILES = ("Pretendard-Light.otf", "Pretendard-Regular.otf", "Pretendard-Bold.otf")
 BRAND_FONT_FAMILY = None
 UI_FONT_FAMILY = None
+WINDOW_WIDTH = 500
+WINDOW_HEIGHT = 720
+WINDOW_MIN_WIDTH = 500
+WINDOW_MIN_HEIGHT = 520
+WINDOW_MAX_WIDTH = 1200
+WINDOW_MAX_HEIGHT = 1400
 
 
 def _resource_path(*parts: str) -> str:
@@ -400,14 +406,39 @@ MUTED_D  = "#9F7774"
 
 # ── Custom Widgets ─────────────────────────────────────────────────────────────
 
+class BrandTitleLabel(QLabel):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._max_point_size = 66
+        self._min_point_size = 36
+        self.setMinimumHeight(92)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(f"color: {WHITE};")
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._fit_font()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_font()
+
+    def _fit_font(self):
+        available_width = max(1, self.contentsRect().width() - 4)
+        for point_size in range(self._max_point_size, self._min_point_size - 1, -1):
+            font = _brand_font(point_size)
+            if QFontMetrics(font).horizontalAdvance(self.text()) <= available_width:
+                self.setFont(font)
+                return
+        self.setFont(_brand_font(self._min_point_size))
+
+
 class PillInput(QLineEdit):
     def __init__(self, placeholder="", parent=None):
         super().__init__(parent)
         self.setPlaceholderText(placeholder)
-        self.setFixedHeight(44)
+        self.setFixedHeight(50)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.setFont(_ui_font(11.0))
+        self.setFont(_ui_font(11.5))
         self.setStyleSheet(f"""
             QLineEdit {{
                 background: #F7F7F6;
@@ -435,7 +466,7 @@ class PillInput(QLineEdit):
 class PillButton(QPushButton):
     def __init__(self, text, primary=False, parent=None):
         super().__init__(text, parent)
-        self.setFixedHeight(42)
+        self.setFixedHeight(50)
         self.setFont(_ui_font(11.0))
         self.setStyleSheet(f"""
             QPushButton {{
@@ -457,7 +488,7 @@ class PillButton(QPushButton):
 class StatusCard(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(42)
+        self.setFixedHeight(46)
         self.setObjectName("statusCard")
         self.setStyleSheet(f"""
             QWidget#statusCard {{
@@ -677,10 +708,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("pinnow")
-        self.setFixedSize(400, 540)
-        # Windows: 최대화 버튼 제거 (setFixedSize만으로는 제거 안 됨)
-        if sys.platform == "win32":
-            self.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint)
+        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.setMaximumSize(WINDOW_MAX_WIDTH, WINDOW_MAX_HEIGHT)
         self._worker = None
         self._thread = None
         self._output = os.path.expanduser("~/Downloads/pinnow")
@@ -691,35 +721,66 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         root.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setCentralWidget(root)
+        root.setMinimumHeight(WINDOW_HEIGHT)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("scrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet(f"""
+            QScrollArea#scrollArea {{
+                background: {BG};
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background: {BG};
+                width: 8px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {SILVER};
+                border-radius: 4px;
+                min-height: 32px;
+            }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {{
+                height: 0;
+                background: transparent;
+            }}
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+        """)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
 
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(36, 60, 36, 18)
+        layout.setContentsMargins(48, 68, 48, 20)
         layout.setSpacing(0)
 
         # ── Header
         header_row = QHBoxLayout()
-        header_row.setSpacing(14)
+        header_row.setSpacing(22)
 
-        title = QLabel("pinnow")
-        title.setFont(_brand_font(52))
-        title.setStyleSheet(f"color: {WHITE};")
-        title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        header_row.addWidget(title, 1)
+        title = BrandTitleLabel("pinnow")
+        header_row.addWidget(title, 3)
 
         tagline = QLabel("for all the\nheavy users\nof pinterest")
-        tagline.setFont(_ui_font(10.0))
+        tagline.setFont(_ui_font(11.0))
         tagline.setStyleSheet(f"color: {WHITE};")
         tagline.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        header_row.addWidget(tagline)
+        header_row.addWidget(tagline, 1)
 
         layout.addLayout(header_row)
 
-        layout.addSpacing(26)
+        layout.addSpacing(30)
 
         self.url_input = PillInput("drop your pinterest link here!")
         layout.addWidget(self.url_input)
-        layout.addSpacing(12)
+        layout.addSpacing(14)
 
         self.dir_input = PillInput()
         self.dir_input.setPlaceholderText("your images go to")
@@ -728,19 +789,24 @@ class MainWindow(QMainWindow):
         self.dir_input.mousePressEvent = lambda event: self._browse()
         layout.addWidget(self.dir_input)
 
-        layout.addSpacing(20)
+        layout.addSpacing(24)
 
+        action_wrap = QWidget()
+        action_wrap.setFixedHeight(240)
         action_row = QHBoxLayout()
-        action_row.setSpacing(20)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(24)
+        action_wrap.setLayout(action_row)
 
         pin_art = QLabel()
-        pin_art.setFixedSize(90, 140)
+        pin_art.setFixedSize(122, 196)
         pin_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pin_art.setPixmap(_pin_pixmap(90, 140))
+        pin_art.setPixmap(_pin_pixmap(122, 196))
         action_row.addWidget(pin_art)
 
         control_col = QVBoxLayout()
-        control_col.setSpacing(8)
+        control_col.setContentsMargins(0, 8, 0, 0)
+        control_col.setSpacing(12)
 
         self.start_btn = PillButton("download images", primary=True)
         self.start_btn.clicked.connect(self._start)
@@ -752,7 +818,7 @@ class MainWindow(QMainWindow):
         control_col.addWidget(self.stop_btn)
 
         pin_box = QFrame()
-        pin_box.setFixedHeight(52)
+        pin_box.setFixedHeight(66)
         pin_box.setStyleSheet(f"""
             QFrame {{
                 background: transparent;
@@ -761,8 +827,8 @@ class MainWindow(QMainWindow):
             }}
         """)
         pin_layout = QVBoxLayout(pin_box)
-        pin_layout.setContentsMargins(10, 6, 10, 6)
-        pin_layout.setSpacing(1)
+        pin_layout.setContentsMargins(10, 8, 10, 8)
+        pin_layout.setSpacing(2)
 
         max_label = QLabel("verified pin")
         max_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -770,7 +836,7 @@ class MainWindow(QMainWindow):
         max_label.setStyleSheet(f"color: {WHITE}; background: transparent; border: none;")
         pin_layout.addWidget(max_label)
 
-        self.pin_count_label = QLabel("999")
+        self.pin_count_label = QLabel("0")
         self.pin_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pin_count_label.setFont(_ui_font(13.0, QFont.Weight.Bold))
         self.pin_count_label.setStyleSheet(f"""
@@ -782,11 +848,10 @@ class MainWindow(QMainWindow):
         """)
         pin_layout.addWidget(self.pin_count_label)
         control_col.addWidget(pin_box)
-        control_col.addStretch()
         action_row.addLayout(control_col, 1)
 
-        layout.addLayout(action_row)
-        layout.addSpacing(14)
+        layout.addWidget(action_wrap)
+        layout.addSpacing(18)
 
         # ── 진행바
         self.progress = QProgressBar()
@@ -794,7 +859,7 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         layout.addWidget(self.progress)
 
-        layout.addSpacing(8)
+        layout.addSpacing(10)
 
         # ── 상태 카드 (항상 표시 — 레이아웃 shift 방지)
         self.status_card = StatusCard()
@@ -930,11 +995,6 @@ class MainWindow(QMainWindow):
             self.status_card.set_state("✓", "완료", "모든 이미지가 저장되었습니다", f"{ok}개")
         else:
             self.status_card.set_state("⚠", f"{ok}개 성공 / {fail}개 실패", "details 눌러서 확인", f"{fail}개 누락")
-
-        # 완료 시 log 패널 자동 오픈
-        if not self.log_panel._visible:
-            self.log_toggle.setChecked(True)
-            self.log_panel.toggle()
 
     def _open_finder(self):
         path = os.path.abspath(self._output)
