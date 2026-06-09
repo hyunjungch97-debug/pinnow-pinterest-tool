@@ -5,8 +5,10 @@ import json
 import re
 import os
 import sys
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 import click
 import requests
 from bs4 import BeautifulSoup
@@ -23,8 +25,11 @@ HEADERS = {
 
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+_THREAD_LOCAL = threading.local()
 
 RESOLUTION_FALLBACKS = ["originals", "736x", "474x", "236x"]
+DOWNLOAD_WORKERS = 8
+BOARD_SCAN_VIEWPORT = {"width": 1280, "height": 1800}
 
 
 def _default_data_dir() -> str:
@@ -45,14 +50,55 @@ BROWSER_DATA_DIR = os.path.join(DATA_DIR, "browser_data")
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
 
+def _session() -> requests.Session:
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        _THREAD_LOCAL.session = sess
+    return sess
+
+
+def normalize_pinterest_url(url: str) -> str:
+    """Pinterest/pin.it URL variants → browser-friendly canonical URL."""
+    url = (url or "").strip()
+    if not url:
+        return url
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        if url.startswith("com/"):
+            url = "https://www.pinterest." + url
+        else:
+            url = "https://" + url.lstrip("/")
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www.pin.it"):
+        host = "pin.it"
+    elif "pinterest." in host:
+        host = "www.pinterest.com"
+
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    return urlunparse(("https", host, path, "", parsed.query, ""))
+
+
 def resolve_short_url(url: str) -> str:
     """pin.it 단축 URL을 실제 URL로 변환"""
-    r = SESSION.head(url, allow_redirects=True, timeout=10)
-    return r.url
+    url = normalize_pinterest_url(url)
+    try:
+        r = SESSION.head(url, allow_redirects=True, timeout=8)
+        if r.url and "pin.it" not in urlparse(r.url).netloc:
+            return normalize_pinterest_url(r.url)
+    except Exception:
+        pass
+    r = SESSION.get(url, allow_redirects=True, timeout=12)
+    r.raise_for_status()
+    return normalize_pinterest_url(r.url)
 
 
 def fetch_page(url: str) -> BeautifulSoup:
-    r = SESSION.get(url, timeout=15)
+    r = SESSION.get(normalize_pinterest_url(url), timeout=15)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
@@ -73,8 +119,9 @@ def extract_pws_data(soup: BeautifulSoup) -> dict:
 def best_image_url(images: dict) -> Optional[str]:
     """orig > 736x > 474x 순으로 가장 큰 이미지 URL 반환"""
     for key in ("orig", "736x", "474x", "236x"):
-        if key in images:
-            return images[key]["url"]
+        item = images.get(key) if isinstance(images, dict) else None
+        if isinstance(item, dict) and item.get("url"):
+            return item["url"]
     return None
 
 
@@ -86,6 +133,7 @@ def to_resolution(url: str, res: str) -> str:
 
 def get_pin_image_url(pin_url: str) -> tuple:
     """핀 URL → (이미지 URL, 핀 ID)"""
+    pin_url = normalize_pinterest_url(pin_url)
     if "pin.it" in pin_url:
         pin_url = resolve_short_url(pin_url)
 
@@ -109,7 +157,7 @@ def get_pin_image_url(pin_url: str) -> tuple:
 
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
-        m = re.search(r"/pin/(\d+)", pin_url)
+        m = re.search(r"/(?:pin|idea-pin)/(\d+)", pin_url)
         pin_id = m.group(1) if m else re.sub(r"[^a-zA-Z0-9]", "_", pin_url[-12:])
         return to_resolution(og["content"].split("?")[0], "originals"), pin_id
 
@@ -123,34 +171,96 @@ def download_with_fallback(base_url: str, dest: str) -> bool:
     for res in RESOLUTION_FALLBACKS:
         url = to_resolution(base_url, res)
         try:
-            r = SESSION.get(url, stream=True, timeout=20)
+            r = _session().get(url, stream=True, timeout=20)
             if r.status_code == 200:
                 with open(dest, "wb") as f:
                     for chunk in r.iter_content(8192):
-                        f.write(chunk)
+                        if chunk:
+                            f.write(chunk)
                 return True
         except Exception:
             continue
     return False
 
 
+def _pin_dest(pin: dict, output: str) -> str:
+    clean_url = pin["url"].split("?")[0]
+    ext = clean_url.rsplit(".", 1)[-1].lower() if "." in clean_url else "jpg"
+    if not re.match(r"^[a-z0-9]{2,5}$", ext):
+        ext = "jpg"
+    return os.path.join(output, f"pin_{pin['id']}.{ext}")
+
+
+def _download_pin(pin: dict, output: str) -> tuple[bool, str]:
+    dest = _pin_dest(pin, output)
+    if os.path.exists(dest):
+        return True, ""
+    ok = download_with_fallback(pin["url"], dest)
+    return ok, "" if ok else f"https://www.pinterest.com/pin/{pin['id']}/"
+
+
+def download_pin_batch(pins: list, output: str, stop_cb=None, progress_cb=None, workers: int = DOWNLOAD_WORKERS) -> tuple[int, list]:
+    """Download pins concurrently with bounded workers."""
+    os.makedirs(output, exist_ok=True)
+    total = len(pins)
+    if total == 0:
+        return 0, []
+
+    ok = 0
+    failed_urls = []
+    done = 0
+    max_workers = max(1, min(workers, total))
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {executor.submit(_download_pin, pin, output): pin for pin in pins}
+    try:
+        for future in as_completed(futures):
+            done += 1
+            try:
+                success, failed_url = future.result()
+            except Exception:
+                pin = futures[future]
+                success = False
+                failed_url = f"https://www.pinterest.com/pin/{pin['id']}/"
+            if success:
+                ok += 1
+            elif failed_url:
+                failed_urls.append(failed_url)
+            if progress_cb:
+                progress_cb(done, total)
+            if stop_cb and stop_cb():
+                for pending in futures:
+                    pending.cancel()
+                break
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return ok, failed_urls
+
+
 # ── 보드 핀 목록 수집 ─────────────────────────────────────────────────────────
 
-# 섹션이 있는 보드는 BoardSectionPinsResource로 핀이 옴 — 모두 캡처
-_FEED_RESOURCES = ("BoardFeedResource", "BoardSectionPinsResource", "SectionFeedResource")
+_PIN_FEED_RESOURCES = {
+    "BoardFeedResource",
+    "BoardSectionPinsResource",
+    "SectionFeedResource",
+}
 
 _DOM_JS = """() => {
-    const feed = document.querySelector("[data-test-id='board-feed']");
-    if (!feed) return [];
+    const root = document.querySelector("[data-test-id='board-feed']");
+    if (!root) return [];
     const seen = new Set();
     const out = [];
-    feed.querySelectorAll("a[href*='/pin/']").forEach(a => {
-        const m = a.href.match(/\\/pin\\/(\\d+)/);
+    const bestFromSrcset = (srcset) => {
+        if (!srcset) return '';
+        const entries = srcset.split(',').map(x => x.trim().split(/\\s+/)[0]).filter(Boolean);
+        return entries.length ? entries[entries.length - 1] : '';
+    };
+    root.querySelectorAll("a[href*='/pin/'], a[href*='/idea-pin/']").forEach(a => {
+        const m = a.href.match(/\\/(?:pin|idea-pin)\\/(\\d+)/);
         if (!m || seen.has(m[1])) return;
         seen.add(m[1]);
         const img = a.querySelector("img");
         const src = img
-            ? (img.src || img.dataset.src || (img.srcset ? img.srcset.split(' ')[0] : '') || '')
+            ? (bestFromSrcset(img.srcset) || img.currentSrc || img.src || img.dataset.src || '')
             : '';
         if (src && !src.startsWith('data:')) out.push({id: m[1], url: src});
     });
@@ -171,7 +281,9 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
         else:
             click.echo(msg)
 
-    normalized = re.sub(r"https?://[a-z]+\.pinterest\.com", "https://www.pinterest.com", board_url)
+    normalized = normalize_pinterest_url(board_url)
+    if "pin.it" in normalized:
+        normalized = resolve_short_url(normalized)
     logged_in = os.path.isdir(BROWSER_DATA_DIR)
 
     pins = []
@@ -179,8 +291,33 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
     api_batches = [0]
     seen_resources: set = set()
 
+    def _add_pin(pin_id: str, img_url: str) -> bool:
+        if not pin_id or not img_url or pin_id in seen:
+            return False
+        seen.add(pin_id)
+        pins.append({"id": pin_id, "url": img_url})
+        return True
+
+    def _extract_pin_items(obj):
+        if isinstance(obj, list):
+            for child in obj:
+                yield from _extract_pin_items(child)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        pin_id = str(obj.get("id", ""))
+        images = obj.get("images", {})
+        if pin_id and isinstance(images, dict) and best_image_url(images):
+            yield obj
+
+        for key in ("data", "items", "pins", "results", "pin", "grid_items"):
+            if key in obj:
+                yield from _extract_pin_items(obj[key])
+
     def on_response(response):
         # 진단: 모든 Pinterest resource URL 기록 (어떤 API가 호출되는지 확인)
+        rname = ""
         if "pinterest.com/resource/" in response.url:
             m = re.search(r"/resource/([^/]+)/", response.url)
             if m:
@@ -189,44 +326,56 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
                     seen_resources.add(rname)
                     _log(f"  [감지] {rname}")
 
-        if not any(r in response.url for r in _FEED_RESOURCES):
+        if rname not in _PIN_FEED_RESOURCES:
             return
         try:
             if response.status != 200:
                 return
             data = response.json()
             resource_resp = data.get("resource_response", {})
-            items = resource_resp.get("data", []) or []
+            payload = resource_resp.get("data", data)
             bookmark = resource_resp.get("bookmark")
 
             before = len(pins)
-            for item in items:
+            for item in _extract_pin_items(payload):
                 pin_id = str(item.get("id", ""))
-                if not pin_id or pin_id in seen:
-                    continue
                 images = item.get("images", {})
                 img_url = best_image_url(images)
-                if img_url:
-                    seen.add(pin_id)
-                    pins.append({"id": pin_id, "url": img_url})
+                _add_pin(pin_id, img_url)
             gained = len(pins) - before
 
-            m2 = re.search(r"/resource/([^/]+)/", response.url)
-            rname = m2.group(1) if m2 else "FeedResource"
             end_flag = " ← 마지막" if bookmark is None else ""
-            _log(f"  [{rname}] +{gained} → {len(pins)}개{end_flag}")
             if gained > 0:
                 api_batches[0] += 1
+                _log(f"  [{rname}] +{gained} → {len(pins)}개{end_flag}")
         except Exception:
             pass
+
+    def _flush_initial_props(page):
+        try:
+            raw = page.locator("script#__PWS_INITIAL_PROPS__").text_content(timeout=1000)
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        before = len(pins)
+        for item in _extract_pin_items(data):
+            pin_id = str(item.get("id", ""))
+            img_url = best_image_url(item.get("images", {}))
+            _add_pin(pin_id, img_url)
+        gained = len(pins) - before
+        if gained > 0:
+            _log(f"  [초기 데이터] +{gained} → {len(pins)}개")
 
     def _flush_dom(page):
         for item in page.evaluate(_DOM_JS):
             pid = str(item.get("id", ""))
             raw = item.get("url", "")
-            if pid and raw and pid not in seen:
-                seen.add(pid)
-                pins.append({"id": pid, "url": to_resolution(raw, "originals")})
+            _add_pin(pid, to_resolution(raw, "originals") if raw else "")
 
     with sync_playwright() as p:
         if logged_in:
@@ -235,12 +384,16 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
                 BROWSER_DATA_DIR,
                 headless=True,
                 user_agent=HEADERS["User-Agent"],
+                viewport=BOARD_SCAN_VIEWPORT,
                 args=["--no-sandbox"],
             )
             page = ctx.new_page()
         else:
             browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport=BOARD_SCAN_VIEWPORT,
+            )
             ctx.set_extra_http_headers({"Accept-Language": "ko-KR,ko;q=0.9"})
             page = ctx.new_page()
 
@@ -250,12 +403,19 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
         page.goto(normalized, wait_until="domcontentloaded", timeout=30000)
 
         try:
-            page.wait_for_selector("[data-test-id='board-feed'] a[href*='/pin/']", timeout=15000)
+            page.wait_for_selector(
+                "[data-test-id='board-feed'] a[href*='/pin/'], "
+                "[data-test-id='board-feed'] a[href*='/idea-pin/']",
+                timeout=12000,
+            )
         except PWTimeout:
-            ctx.close()
-            raise click.ClickException("보드 핀을 찾을 수 없습니다. URL이 올바른지, 보드가 공개인지 확인하세요.")
+            _flush_dom(page)
+            if not pins:
+                ctx.close()
+                raise click.ClickException("핀을 찾을 수 없습니다. URL이 올바른지, 보드/프로필이 공개인지 확인하세요.")
 
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(1000)
+        _flush_initial_props(page)
         _flush_dom(page)
         _log(f"  초기 로드: {len(pins)}개")
 
@@ -264,8 +424,8 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
         try:
             while len(pins) < max_pins:
                 prev = len(pins)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(3000)
+                page.evaluate("window.scrollBy(0, Math.max(window.innerHeight * 2, 1200))")
+                page.wait_for_timeout(900)
                 _flush_dom(page)
                 added = len(pins) - prev
                 if added > 0:
@@ -273,14 +433,13 @@ def fetch_board_pins(board_url: str, max_pins: int, log_cb=None) -> list:
                     stall = 0
                 else:
                     stall += 1
-                    _log(f"  스크롤 무반응 {stall}회 (현재 {len(pins)}개)")
-                    if stall >= 8:
+                    if stall >= 6:
                         break
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(500)
         finally:
             bar.close()
 
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(800)
         _flush_dom(page)
         _log(f"  최종 {len(pins)}개 / API 배치 {api_batches[0]}회")
         _log(f"  감지된 API 타입: {', '.join(sorted(seen_resources)) or '없음'}")
@@ -372,20 +531,12 @@ def board(board_url, output, max_pins):
         raise click.ClickException("핀을 찾을 수 없습니다. URL을 확인하거나 보드가 공개인지 확인하세요.")
 
     click.echo(f"\n{len(pins)}개 핀 다운로드 시작 → {output}/")
-    ok = 0
-    failed_urls = []
-
-    for p in tqdm(pins, desc="다운로드", unit="핀"):
-        ext = p["url"].split("?")[0].rsplit(".", 1)[-1] or "jpg"
-        dest = os.path.join(output, f"pin_{p['id']}.{ext}")
-        if os.path.exists(dest):
-            ok += 1
-            continue
-        if download_with_fallback(p["url"], dest):
-            ok += 1
-        else:
-            failed_urls.append(f"https://www.pinterest.com/pin/{p['id']}/")
-        time.sleep(0.1)
+    with tqdm(total=len(pins), desc="다운로드", unit="핀") as bar:
+        ok, failed_urls = download_pin_batch(
+            pins,
+            output,
+            progress_cb=lambda _cur, _total: bar.update(1),
+        )
 
     # 실패한 핀 목록을 파일로 저장
     if failed_urls:

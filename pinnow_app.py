@@ -5,8 +5,6 @@ import sys
 import os
 import subprocess
 import re
-import time
-import threading
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -313,13 +311,13 @@ class DownloadWorker(QObject):
     def run(self):
         try:
             os.makedirs(self.output, exist_ok=True)
-            url = self.url
+            url = core.normalize_pinterest_url(self.url)
             # pin.it 단축 URL은 실제 URL로 먼저 resolve
             if "pin.it" in url:
                 self.status.emit("URL 확인 중...")
                 url = core.resolve_short_url(url)
                 self.log.emit(f"→ {url}")
-            is_pin = bool(re.search(r"/pin/\d+", url))
+            is_pin = bool(re.search(r"/(?:pin|idea-pin)/\d+", url))
             self.url = url
 
             if is_pin:
@@ -351,25 +349,16 @@ class DownloadWorker(QObject):
                 self.log.emit(f"{len(pin_list)}개 핀 발견")
                 self.status.emit(f"{len(pin_list)}개 다운로드 중...")
 
-                ok = fail = 0
-                failed_urls = []
                 total = len(pin_list)
-
-                for i, p in enumerate(pin_list):
-                    if self._stop:
-                        self.log.emit("다운로드 중단됨")
-                        break
-                    ext = p["url"].split("?")[0].rsplit(".", 1)[-1] or "jpg"
-                    dest = os.path.join(self.output, f"pin_{p['id']}.{ext}")
-                    if os.path.exists(dest):
-                        ok += 1
-                    elif core.download_with_fallback(p["url"], dest):
-                        ok += 1
-                    else:
-                        fail += 1
-                        failed_urls.append(f"https://www.pinterest.com/pin/{p['id']}/")
-                    self.progress.emit(i + 1, total)
-                    time.sleep(0.05)
+                ok, failed_urls = core.download_pin_batch(
+                    pin_list,
+                    self.output,
+                    stop_cb=lambda: self._stop,
+                    progress_cb=lambda cur, max_total=total: self.progress.emit(cur, max_total),
+                )
+                fail = len(failed_urls)
+                if self._stop:
+                    self.log.emit("다운로드 중단됨")
 
                 failed_path = ""
                 if failed_urls:
@@ -483,6 +472,59 @@ class PillButton(QPushButton):
                 border-color: {SILVER_D};
             }}
         """)
+
+
+class VerifiedPinButton(QPushButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(66)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setEnabled(False)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: 3px solid {SILVER};
+                border-radius: 10px;
+            }}
+            QPushButton:hover:enabled {{
+                background: {BG_LIGHT};
+                border-color: {WHITE};
+            }}
+            QPushButton:pressed:enabled {{
+                background: {BG_DARK};
+            }}
+            QPushButton:disabled {{
+                background: transparent;
+                border-color: {SILVER_D};
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        self.title_label = QLabel("verified pin")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setFont(_ui_font(11.0, QFont.Weight.Bold))
+        self.title_label.setStyleSheet("background: transparent; border: none;")
+        layout.addWidget(self.title_label)
+
+        self.count_label = QLabel("0")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.count_label.setFont(_ui_font(13.0, QFont.Weight.Bold))
+        self.count_label.setStyleSheet("background: transparent; border: none;")
+        layout.addWidget(self.count_label)
+        self.set_count(0)
+        self.set_open_enabled(False)
+
+    def set_count(self, count):
+        self.count_label.setText(str(count))
+
+    def set_open_enabled(self, enabled: bool):
+        self.setEnabled(enabled)
+        color = WHITE if enabled else SILVER_D
+        self.title_label.setStyleSheet(f"color: {color}; background: transparent; border: none;")
+        self.count_label.setStyleSheet(f"color: {color}; background: transparent; border: none;")
 
 
 class StatusCard(QWidget):
@@ -817,37 +859,9 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop)
         control_col.addWidget(self.stop_btn)
 
-        pin_box = QFrame()
-        pin_box.setFixedHeight(66)
-        pin_box.setStyleSheet(f"""
-            QFrame {{
-                background: transparent;
-                border: 3px solid {SILVER};
-                border-radius: 10px;
-            }}
-        """)
-        pin_layout = QVBoxLayout(pin_box)
-        pin_layout.setContentsMargins(10, 8, 10, 8)
-        pin_layout.setSpacing(2)
-
-        max_label = QLabel("verified pin")
-        max_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        max_label.setFont(_ui_font(11.0, QFont.Weight.Bold))
-        max_label.setStyleSheet(f"color: {WHITE}; background: transparent; border: none;")
-        pin_layout.addWidget(max_label)
-
-        self.pin_count_label = QLabel("0")
-        self.pin_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.pin_count_label.setFont(_ui_font(13.0, QFont.Weight.Bold))
-        self.pin_count_label.setStyleSheet(f"""
-            QLabel {{
-                background: transparent;
-                border: none;
-                color: {WHITE};
-            }}
-        """)
-        pin_layout.addWidget(self.pin_count_label)
-        control_col.addWidget(pin_box)
+        self.verified_btn = VerifiedPinButton()
+        self.verified_btn.clicked.connect(self._open_finder)
+        control_col.addWidget(self.verified_btn)
         action_row.addLayout(control_col, 1)
 
         layout.addWidget(action_wrap)
@@ -870,51 +884,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.failed_panel)
 
         layout.addStretch()
-
-        # ── 로그 토글 & Finder 버튼
-        log_row = QHBoxLayout()
-        self.log_toggle = QPushButton("details")
-        self.log_toggle.setCheckable(True)
-        self.log_toggle.setFixedHeight(24)
-        self.log_toggle.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                color: {MUTED_D};
-                font-size: 11px;
-                text-align: left;
-                padding: 0;
-            }}
-            QPushButton:hover {{ color: {SILVER}; }}
-            QPushButton:checked {{ color: {SILVER}; font-weight: 600; }}
-        """)
-        self.log_toggle.clicked.connect(self._toggle_log)
-        log_row.addWidget(self.log_toggle)
-        log_row.addStretch()
-
-        self.open_btn = QPushButton("open folder")
-        self.open_btn.setEnabled(False)
-        self.open_btn.setFixedHeight(24)
-        self.open_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                color: {WHITE};
-                font-size: 11px;
-                font-weight: 600;
-            }}
-            QPushButton:hover {{ color: {SILVER}; }}
-            QPushButton:disabled {{ color: #6B3030; }}
-        """)
-        self.open_btn.clicked.connect(self._open_finder)
-        log_row.addWidget(self.open_btn)
-        self.log_row_widget = QWidget()
-        self.log_row_widget.setLayout(log_row)
-        layout.addWidget(self.log_row_widget)
-
-        self.log_panel = LogPanel()
-        self.log_panel.hide()
-        layout.addWidget(self.log_panel)
+        self._logs = []
 
         footer = QLabel("all rights reserved choic0re")
         footer.setFont(_ui_font(10.0))
@@ -922,10 +892,6 @@ class MainWindow(QMainWindow):
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(footer)
         root.setFocus()
-
-    def _toggle_log(self):
-        self.log_panel.toggle()
-        self.log_toggle.setText("hide details" if self.log_panel._visible else "details")
 
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.dir_input.text() or self._output)
@@ -937,7 +903,7 @@ class MainWindow(QMainWindow):
         if total > 0:
             self.progress.setMaximum(total)
             self.progress.setValue(cur)
-            self.pin_count_label.setText(str(cur))
+            self.verified_btn.set_count(cur)
             pct = int(cur / total * 100)
             self.status_card.set_state("⬇", "다운로드 중", f"{cur} / {total}개", f"{pct}%")
 
@@ -945,7 +911,7 @@ class MainWindow(QMainWindow):
         self.status_card.set_state("⏳", msg, "잠시 기다려 주세요", "")
 
     def _log(self, msg: str):
-        self.log_panel.append(msg)
+        self._logs.append(msg)
 
     def _start(self):
         url = self.url_input.text().strip()
@@ -957,10 +923,10 @@ class MainWindow(QMainWindow):
         self._output = output
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.open_btn.setEnabled(False)
+        self.verified_btn.set_open_enabled(False)
         self.progress.setValue(0)
-        self.pin_count_label.setText("0")
-        self.log_panel.text.clear()
+        self.verified_btn.set_count("0")
+        self._logs.clear()
         self.failed_panel.hide_panel()
         self.status_card.set_state("⏳", "시작 중...", "브라우저를 여는 중입니다", "")
 
@@ -986,15 +952,15 @@ class MainWindow(QMainWindow):
         self._thread.wait()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.open_btn.setEnabled(True)
+        self.verified_btn.set_open_enabled(True)
         self.progress.setMaximum(max(ok + fail, 1))
         self.progress.setValue(ok + fail)
-        self.pin_count_label.setText(str(ok))
+        self.verified_btn.set_count(ok)
 
         if fail == 0:
             self.status_card.set_state("✓", "완료", "모든 이미지가 저장되었습니다", f"{ok}개")
         else:
-            self.status_card.set_state("⚠", f"{ok}개 성공 / {fail}개 실패", "details 눌러서 확인", f"{fail}개 누락")
+            self.status_card.set_state("⚠", f"{ok}개 성공 / {fail}개 실패", "실패 목록을 확인하세요", f"{fail}개 누락")
 
     def _open_finder(self):
         path = os.path.abspath(self._output)
